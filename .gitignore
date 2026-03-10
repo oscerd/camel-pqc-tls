@@ -1,0 +1,10 @@
+# Build output
+target/
+
+# Certificate material
+*.p12
+*.jks
+*.pem
+*.crt
+*.key
+*.cer

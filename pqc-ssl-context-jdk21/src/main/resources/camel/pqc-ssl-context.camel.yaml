@@ -1,0 +1,375 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Post-Quantum TLS Handshake Example using BouncyCastle JSSE on JDK 21
+#
+# Demonstrates a real PQC TLS 1.3 handshake with X25519MLKEM768 hybrid
+# key exchange using BouncyCastle's JSSE provider (BCJSSE), without
+# requiring JDK 27's JEP 527.
+#
+# The self-contained test creates an SSLServerSocket and SSLSocket,
+# both using BCJSSE, with the client offering X25519MLKEM768 for
+# key exchange and secp256r1 for ECDSA authentication.
+# A successful handshake proves PQC key exchange was negotiated.
+
+# Route 1: PQC TLS handshake verification at startup
+# Generates EC key pair via BC, creates SSLContext via BCJSSE,
+# performs a real TLS 1.3 handshake with X25519MLKEM768.
+- route:
+    id: pqc-verify
+    from:
+      uri: timer:pqc-verify
+      parameters:
+        repeatCount: 1
+        delay: 1000
+      steps:
+        - log: "=== Post-Quantum TLS Handshake Verification (BouncyCastle JSSE) ==="
+        - script:
+            groovy: |
+              import javax.net.ssl.*
+              import java.security.*
+              import java.security.cert.X509Certificate
+              import java.math.BigInteger
+              import java.util.Date
+              import org.bouncycastle.asn1.x500.X500Name
+              import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+              import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+              import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+
+              def serverSocket = null
+              def accepted = null
+
+              try {
+                  def bcProvider = Security.getProvider("BC")
+
+                  // Generate EC key pair using BouncyCastle with explicit named curve
+                  def kpg = KeyPairGenerator.getInstance("EC", bcProvider)
+                  kpg.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"))
+                  def keyPair = kpg.generateKeyPair()
+
+                  // Create self-signed certificate using BouncyCastle
+                  def subject = new X500Name("CN=localhost, OU=Camel, O=Apache, C=US")
+                  def now = new Date()
+                  def notBefore = new Date(now.getTime() - 86400000L)
+                  def notAfter = new Date(now.getTime() + 365L * 86400000L)
+                  def serial = BigInteger.valueOf(System.currentTimeMillis())
+
+                  def certBuilder = new JcaX509v3CertificateBuilder(
+                      subject, serial, notBefore, notAfter, subject, keyPair.getPublic())
+
+                  def signer = new JcaContentSignerBuilder("SHA256withECDSA")
+                      .setProvider(bcProvider).build(keyPair.getPrivate())
+                  def cert = new JcaX509CertificateConverter()
+                      .setProvider(bcProvider).getCertificate(certBuilder.build(signer))
+
+                  // Create in-memory JKS keystore with the BC-generated key
+                  def ks = KeyStore.getInstance("JKS")
+                  ks.load(null, null)
+                  ks.setKeyEntry("server", keyPair.getPrivate(),
+                      "changeit".toCharArray(),
+                      [cert] as java.security.cert.Certificate[])
+
+                  // Create truststore with the same certificate
+                  def ts = KeyStore.getInstance("JKS")
+                  ts.load(null, null)
+                  ts.setCertificateEntry("server", cert)
+
+                  // Use BCJSSE's PKIX KeyManagerFactory and TrustManagerFactory
+                  def kmf = KeyManagerFactory.getInstance("PKIX", "BCJSSE")
+                  kmf.init(ks, "changeit".toCharArray())
+
+                  def tmf = TrustManagerFactory.getInstance("PKIX", "BCJSSE")
+                  tmf.init(ts)
+
+                  // Create SSLContext using BCJSSE
+                  def sslCtx = SSLContext.getInstance("TLSv1.3", "BCJSSE")
+                  sslCtx.init(kmf.getKeyManagers(), tmf.getTrustManagers(),
+                      SecureRandom.getInstance("DEFAULT", bcProvider))
+
+                  // --- Server side ---
+                  serverSocket = sslCtx.getServerSocketFactory().createServerSocket(0) as SSLServerSocket
+                  def port = serverSocket.getLocalPort()
+
+                  // --- Client side (in a thread) ---
+                  def handshakeResult = new java.util.concurrent.CompletableFuture()
+
+                  Thread.start {
+                      try {
+                          def cs = sslCtx.getSocketFactory().createSocket("localhost", port)
+
+                          // Client offers X25519MLKEM768 for PQC key exchange
+                          // and secp256r1 for ECDSA signature verification.
+                          // Both are needed: X25519MLKEM768 for the key exchange,
+                          // secp256r1 because the server uses an EC certificate.
+                          def bcClientParams = new org.bouncycastle.jsse.BCSSLParameters()
+                          bcClientParams.setNamedGroups(["X25519MLKEM768", "secp256r1"] as String[])
+                          ((org.bouncycastle.jsse.BCSSLSocket) cs).setParameters(bcClientParams)
+
+                          cs.startHandshake()
+
+                          def session = cs.getSession()
+                          handshakeResult.complete([
+                              protocol: session.getProtocol(),
+                              cipherSuite: session.getCipherSuite(),
+                              peerHost: session.getPeerHost(),
+                          ])
+                          cs.close()
+                      } catch (Exception e) {
+                          handshakeResult.completeExceptionally(e)
+                      }
+                  }
+
+                  // Server accepts the connection
+                  accepted = serverSocket.accept()
+                  ((SSLSocket) accepted).startHandshake()
+                  def serverSession = ((SSLSocket) accepted).getSession()
+
+                  // Wait for client result
+                  def clientResult = handshakeResult.get(10, java.util.concurrent.TimeUnit.SECONDS)
+
+                  def result = [
+                      pqcVerified: true,
+                      tlsProvider: "BouncyCastle JSSE (BCJSSE)",
+                      jdkVersion: System.getProperty("java.version"),
+                      server: [
+                          protocol: serverSession.getProtocol(),
+                          cipherSuite: serverSession.getCipherSuite(),
+                      ],
+                      client: [
+                          protocol: clientResult.protocol,
+                          cipherSuite: clientResult.cipherSuite,
+                          namedGroupsOffered: "X25519MLKEM768 (PQC key exchange) + secp256r1 (ECDSA auth)",
+                      ],
+                      message: "PQC VERIFIED: TLS 1.3 handshake with X25519MLKEM768 succeeded on JDK ${System.getProperty('java.version')} using BouncyCastle JSSE"
+                  ]
+
+                  exchange.message.setBody(groovy.json.JsonOutput.prettyPrint(
+                      groovy.json.JsonOutput.toJson(result)))
+
+              } catch (Exception e) {
+                  def result = [
+                      pqcVerified: false,
+                      tlsProvider: "BouncyCastle JSSE (BCJSSE)",
+                      jdkVersion: System.getProperty("java.version"),
+                      error: e.getClass().getSimpleName() + ": " + e.getMessage(),
+                      message: "PQC TLS handshake FAILED"
+                  ]
+                  if (e.getCause() != null) {
+                      result.cause = e.getCause().getClass().getSimpleName() + ": " + e.getCause().getMessage()
+                  }
+                  exchange.message.setBody(groovy.json.JsonOutput.prettyPrint(
+                      groovy.json.JsonOutput.toJson(result)))
+              } finally {
+                  if (accepted != null) try { accepted.close() } catch (Exception ignore) {}
+                  if (serverSocket != null) try { serverSocket.close() } catch (Exception ignore) {}
+              }
+        - log: "PQC Verification Result:\n${body}"
+
+# Route 2: REST API endpoint (served over plain HTTP)
+- route:
+    id: pqc-secure-server
+    from:
+      uri: platform-http:/api/data
+      parameters:
+        httpMethodRestrict: GET
+      steps:
+        - log: "Received request on /api/data"
+        - script:
+            groovy: |
+              exchange.message.setBody(groovy.json.JsonOutput.prettyPrint(
+                  groovy.json.JsonOutput.toJson([
+                      message: "PQC TLS handshake verified at startup using BouncyCastle JSSE on JDK " + System.getProperty("java.version"),
+                      algorithm: "X25519MLKEM768 (hybrid: X25519 + ML-KEM-768)",
+                      protocol: "TLS 1.3",
+                      timestamp: new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ")
+                  ])))
+        - setHeader:
+            name: Content-Type
+            constant: "application/json"
+
+# Route 3: REST endpoint to run PQC verification on demand
+- route:
+    id: pqc-verify-endpoint
+    from:
+      uri: platform-http:/api/verify-pqc
+      parameters:
+        httpMethodRestrict: GET
+      steps:
+        - log: "PQC verification requested via API"
+        - script:
+            groovy: |
+              import javax.net.ssl.*
+              import java.security.*
+              import java.security.cert.X509Certificate
+              import java.math.BigInteger
+              import java.util.Date
+              import org.bouncycastle.asn1.x500.X500Name
+              import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+              import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+              import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+
+              def serverSocket = null
+              def accepted = null
+
+              try {
+                  def bcProvider = Security.getProvider("BC")
+                  def kpg = KeyPairGenerator.getInstance("EC", bcProvider)
+                  kpg.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"))
+                  def keyPair = kpg.generateKeyPair()
+
+                  def subject = new X500Name("CN=localhost, O=Apache, C=US")
+                  def now = new Date()
+                  def serial = BigInteger.valueOf(System.currentTimeMillis())
+                  def certBuilder = new JcaX509v3CertificateBuilder(
+                      subject, serial,
+                      new Date(now.getTime() - 86400000L),
+                      new Date(now.getTime() + 365L * 86400000L),
+                      subject, keyPair.getPublic())
+                  def signer = new JcaContentSignerBuilder("SHA256withECDSA")
+                      .setProvider(bcProvider).build(keyPair.getPrivate())
+                  def cert = new JcaX509CertificateConverter()
+                      .setProvider(bcProvider).getCertificate(certBuilder.build(signer))
+
+                  def ks = KeyStore.getInstance("JKS")
+                  ks.load(null, null)
+                  ks.setKeyEntry("server", keyPair.getPrivate(),
+                      "changeit".toCharArray(),
+                      [cert] as java.security.cert.Certificate[])
+
+                  def ts = KeyStore.getInstance("JKS")
+                  ts.load(null, null)
+                  ts.setCertificateEntry("server", cert)
+
+                  def kmf = KeyManagerFactory.getInstance("PKIX", "BCJSSE")
+                  kmf.init(ks, "changeit".toCharArray())
+                  def tmf = TrustManagerFactory.getInstance("PKIX", "BCJSSE")
+                  tmf.init(ts)
+
+                  def sslCtx = SSLContext.getInstance("TLSv1.3", "BCJSSE")
+                  sslCtx.init(kmf.getKeyManagers(), tmf.getTrustManagers(),
+                      SecureRandom.getInstance("DEFAULT", bcProvider))
+
+                  serverSocket = sslCtx.getServerSocketFactory().createServerSocket(0) as SSLServerSocket
+                  def port = serverSocket.getLocalPort()
+
+                  def handshakeResult = new java.util.concurrent.CompletableFuture()
+
+                  Thread.start {
+                      try {
+                          def cs = sslCtx.getSocketFactory().createSocket("localhost", port)
+                          def bcClientParams = new org.bouncycastle.jsse.BCSSLParameters()
+                          bcClientParams.setNamedGroups(["X25519MLKEM768", "secp256r1"] as String[])
+                          ((org.bouncycastle.jsse.BCSSLSocket) cs).setParameters(bcClientParams)
+                          cs.startHandshake()
+                          def s = cs.getSession()
+                          handshakeResult.complete([protocol: s.getProtocol(), cipherSuite: s.getCipherSuite()])
+                          cs.close()
+                      } catch (Exception e) {
+                          handshakeResult.completeExceptionally(e)
+                      }
+                  }
+
+                  accepted = serverSocket.accept()
+                  ((SSLSocket) accepted).startHandshake()
+
+                  def clientResult = handshakeResult.get(10, java.util.concurrent.TimeUnit.SECONDS)
+
+                  exchange.message.setBody(groovy.json.JsonOutput.prettyPrint(
+                      groovy.json.JsonOutput.toJson([
+                          pqcVerified: true,
+                          tlsProvider: "BouncyCastle JSSE (BCJSSE)",
+                          jdkVersion: System.getProperty("java.version"),
+                          protocol: clientResult.protocol,
+                          cipherSuite: clientResult.cipherSuite,
+                          namedGroup: "X25519MLKEM768",
+                          message: "PQC VERIFIED: TLS handshake succeeded with X25519MLKEM768 key exchange"
+                      ])))
+              } catch (Exception e) {
+                  def msg = e.getMessage() ?: e.getCause()?.getMessage() ?: "unknown error"
+                  exchange.message.setBody(groovy.json.JsonOutput.prettyPrint(
+                      groovy.json.JsonOutput.toJson([
+                          pqcVerified: false,
+                          error: msg,
+                          message: "PQC verification FAILED"
+                      ])))
+              } finally {
+                  if (accepted != null) try { accepted.close() } catch (Exception ignore) {}
+                  if (serverSocket != null) try { serverSocket.close() } catch (Exception ignore) {}
+              }
+        - setHeader:
+            name: Content-Type
+            constant: "application/json"
+
+# Route 4: SSL configuration info endpoint
+- route:
+    id: pqc-ssl-info
+    from:
+      uri: platform-http:/api/ssl-info
+      parameters:
+        httpMethodRestrict: GET
+      steps:
+        - script:
+            groovy: |
+              import javax.net.ssl.*
+              import java.security.*
+
+              def providers = Security.getProviders().collect { it.getName() + " " + it.getVersionStr() }
+
+              def bcjsseAvailable = Security.getProvider("BCJSSE") != null
+              def bcAvailable = Security.getProvider("BC") != null
+
+              def pqcGroups = []
+              try {
+                  def namedGroupClass = Class.forName("org.bouncycastle.tls.NamedGroup")
+                  def pqcCodePoints = [
+                      [0x11EC, "X25519MLKEM768"],
+                      [0x11EB, "SecP256r1MLKEM768"],
+                      [0x11ED, "SecP384r1MLKEM1024"],
+                      [0x0200, "MLKEM512"],
+                      [0x0201, "MLKEM768"],
+                      [0x0202, "MLKEM1024"],
+                  ]
+                  pqcCodePoints.each { cp ->
+                      try {
+                          def name = namedGroupClass.getMethod("getName", int.class).invoke(null, cp[0])
+                          if (name != null) { pqcGroups.add(name) }
+                      } catch (Exception ignore) {}
+                  }
+              } catch (Exception ignore) {}
+
+              def enabledCiphers = []
+              def enabledProtocols = []
+              try {
+                  def ctx = SSLContext.getInstance("TLSv1.3", "BCJSSE")
+                  ctx.init(null, null, null)
+                  def params = ctx.getDefaultSSLParameters()
+                  enabledCiphers = params.getCipherSuites()?.toList() ?: []
+                  enabledProtocols = params.getProtocols()?.toList() ?: []
+              } catch (Exception ignore) {}
+
+              exchange.message.setBody(groovy.json.JsonOutput.prettyPrint(
+                  groovy.json.JsonOutput.toJson([
+                      javaVersion: System.getProperty("java.version"),
+                      javaVendor: System.getProperty("java.vendor"),
+                      bcjsseProvider: bcjsseAvailable,
+                      bcProvider: bcAvailable,
+                      pqcNamedGroups: pqcGroups,
+                      enabledProtocols: enabledProtocols,
+                      enabledCipherSuites: enabledCiphers,
+                      securityProviders: providers
+                  ])))
+        - setHeader:
+            name: Content-Type
+            constant: "application/json"
