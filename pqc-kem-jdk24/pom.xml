@@ -31,7 +31,7 @@
     <properties>
         <maven.compiler.release>24</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <camel.version>4.19.0-SNAPSHOT</camel.version>
+        <camel.version>4.20.0</camel.version>
         <bouncycastle.version>1.83</bouncycastle.version>
     </properties>
 
@@ -89,20 +89,6 @@
         <dependency>
             <groupId>org.bouncycastle</groupId>
             <artifactId>bctls-jdk18on</artifactId>
-            <version>${bouncycastle.version}</version>
-        </dependency>
-
-        <!-- BouncyCastle PKI support -->
-        <dependency>
-            <groupId>org.bouncycastle</groupId>
-            <artifactId>bcpkix-jdk18on</artifactId>
-            <version>${bouncycastle.version}</version>
-        </dependency>
-
-        <!-- BouncyCastle utility -->
-        <dependency>
-            <groupId>org.bouncycastle</groupId>
-            <artifactId>bcutil-jdk18on</artifactId>
             <version>${bouncycastle.version}</version>
         </dependency>
 

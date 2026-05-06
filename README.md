@@ -12,7 +12,7 @@ This repository contains three examples demonstrating **Post-Quantum Cryptograph
 | [`pqc-kem-jdk24`](pqc-kem-jdk24/) | **JDK 24** | BouncyCastle JSSE 1.83 | BCJSSE for PQC TLS, JDK has native ML-KEM primitives via JEP 496 |
 | [`pqc-ssl-context-jdk21`](pqc-ssl-context-jdk21/) | **JDK 21** | BouncyCastle JSSE 1.83 | BCJSSE replaces SunJSSE to provide PQC TLS support today |
 
-All three examples perform the same fundamental operation: a self-contained TLS 1.3 handshake using `X25519MLKEM768` for post-quantum key exchange, verified at startup and available on demand via REST endpoints.
+All three examples are configured entirely through `camel.ssl.*` properties and perform a self-contained TLS 1.3 handshake using `X25519MLKEM768` for post-quantum key exchange, verified at startup and available on demand via REST endpoints.
 
 ## How They Differ
 
@@ -20,8 +20,8 @@ All three examples perform the same fundamental operation: a self-contained TLS 
 
 Uses the JDK's built-in SunJSSE provider, which gains PQC TLS support through [JEP 527](https://openjdk.org/jeps/527) in JDK 27.
 
-- PQC configured via standard Camel SSL properties (`camel.ssl.namedGroups=X25519MLKEM768,x25519`)
-- Certificates pre-generated via `keytool` and a shell script (`generate-certs.sh`)
+- PQC configured via `camel.ssl.namedGroups=X25519MLKEM768,x25519`
+- Self-signed certificate generated automatically (`camel.ssl.selfSigned=true`)
 - REST endpoints served over **HTTPS** on port 8443
 - Named groups set through `SSLParameters.setNamedGroups()` (standard JDK API)
 
@@ -29,19 +29,20 @@ Uses the JDK's built-in SunJSSE provider, which gains PQC TLS support through [J
 
 Uses BouncyCastle's JSSE provider (BCJSSE) to bring PQC TLS support to JDK 24. While JDK 24 includes native ML-KEM as a standalone crypto primitive ([JEP 496](https://openjdk.org/jeps/496)), it does not expose PQC named groups in its TLS stack. BCJSSE bridges that gap.
 
-- PQC configured via BouncyCastle's `BCSSLParameters.setNamedGroups()` API
-- Certificates **generated programmatically at runtime** using BouncyCastle's crypto API
-- REST endpoints served over **HTTP** on port 8080
-- The `/api/ssl-info` endpoint also reports JDK 24's native KEM provider registrations
+- PQC configured via `camel.ssl.provider=BCJSSE` and `camel.ssl.namedGroups=X25519MLKEM768,secp256r1`
+- Self-signed certificate generated automatically (`camel.ssl.selfSigned=true`)
+- REST endpoints served over **HTTPS** on port 8443
+- Additional `/api/verify-kem` endpoint demonstrates JDK 24's native `javax.crypto.KEM` API with cross-provider interop tests
+- Requires a bootstrap class to register BouncyCastle providers
 
 ### JDK 21 with BouncyCastle (`pqc-ssl-context-jdk21`)
 
 Uses BouncyCastle's JSSE provider (BCJSSE) to bring PQC TLS support to JDK 21, without waiting for JDK 27.
 
-- PQC configured via BouncyCastle's `BCSSLParameters.setNamedGroups()` API
-- Certificates **generated programmatically at runtime** using BouncyCastle's crypto API (no external files needed)
-- REST endpoints served over **HTTP** on port 8080 (the PQC handshake is a self-contained internal test)
-- Requires a bootstrap class (`PQCSSLContextApplication.java`) to remove `ECDH` from `jdk.tls.disabledAlgorithms` and register BouncyCastle providers
+- PQC configured via `camel.ssl.provider=BCJSSE` and `camel.ssl.namedGroups=X25519MLKEM768,secp256r1`
+- Self-signed certificate generated automatically (`camel.ssl.selfSigned=true`)
+- REST endpoints served over **HTTPS** on port 8443
+- Requires a bootstrap class to register BouncyCastle providers and remove `ECDH` from `jdk.tls.disabledAlgorithms`
 
 ### Side-by-Side Comparison
 
@@ -51,16 +52,15 @@ Uses BouncyCastle's JSSE provider (BCJSSE) to bring PQC TLS support to JDK 21, w
 | TLS provider | SunJSSE | BCJSSE 1.83 | BCJSSE 1.83 |
 | PQC mechanism | JEP 527 (built-in) | BouncyCastle TLS library | BouncyCastle TLS library |
 | Native ML-KEM (KEM API) | Yes | Yes (JEP 496) | No |
-| Configuration | `camel.ssl.*` properties | `BCSSLParameters` in Groovy scripts | `BCSSLParameters` in Groovy scripts |
-| Certificate management | `keytool` + shell script | Programmatic (BC API) | Programmatic (BC API) |
-| Named groups API | `SSLParameters.setNamedGroups()` | `BCSSLParameters.setNamedGroups()` | `BCSSLParameters.setNamedGroups()` |
-| REST port | 8443 (HTTPS) | 8080 (HTTP) | 8080 (HTTP) |
-| Extra dependencies | None (JDK native) | `bcprov`, `bctls`, `bcpkix`, `bcutil` | `bcprov`, `bctls`, `bcpkix`, `bcutil` |
+| Configuration | `camel.ssl.*` properties | `camel.ssl.*` properties | `camel.ssl.*` properties |
+| Certificate management | `camel.ssl.selfSigned=true` | `camel.ssl.selfSigned=true` | `camel.ssl.selfSigned=true` |
+| REST port | 8443 (HTTPS) | 8443 (HTTPS) | 8443 (HTTPS) |
+| Extra dependencies | None (JDK native) | `bcprov`, `bctls` | `bcprov`, `bctls` |
 
 ## Prerequisites
 
 - **Maven 3.9+**
-- **Apache Camel 4.19.0-SNAPSHOT** installed in local Maven repository
+- **Apache Camel 4.19.0-SNAPSHOT** (or later) installed in local Maven repository
 - **JDK 27 EA** for the native example, **JDK 24** for the JDK 24 example, or **JDK 21+** for the JDK 21 example
 
 ## Quick Start
@@ -69,7 +69,6 @@ Uses BouncyCastle's JSSE provider (BCJSSE) to bring PQC TLS support to JDK 21, w
 
 ```sh
 cd pqc-ssl-context
-./generate-certs.sh
 sdk use java 27.ea.11-open
 mvn clean compile exec:exec
 curl -k https://localhost:8443/api/verify-pqc
@@ -81,7 +80,8 @@ curl -k https://localhost:8443/api/verify-pqc
 cd pqc-kem-jdk24
 sdk use java 24.0.1-tem
 mvn clean compile exec:exec
-curl http://localhost:8080/api/verify-pqc
+curl -k https://localhost:8443/api/verify-pqc
+curl -k https://localhost:8443/api/verify-kem
 ```
 
 ### JDK 21 example
@@ -90,7 +90,7 @@ curl http://localhost:8080/api/verify-pqc
 cd pqc-ssl-context-jdk21
 sdk use java 21.0.10-tem
 mvn clean compile exec:exec
-curl http://localhost:8080/api/verify-pqc
+curl -k https://localhost:8443/api/verify-pqc
 ```
 
 All three will return `"pqcVerified": true` when the PQC TLS handshake succeeds.

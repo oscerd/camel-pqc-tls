@@ -31,7 +31,7 @@
     <properties>
         <maven.compiler.release>24</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <camel.version>4.19.0-SNAPSHOT</camel.version>
+        <camel.version>4.20.0</camel.version>
         <java27.home>${user.home}/.sdkman/candidates/java/27.ea.11-open</java27.home>
     </properties>
 

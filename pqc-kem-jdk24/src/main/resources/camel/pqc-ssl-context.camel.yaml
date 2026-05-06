@@ -15,18 +15,12 @@
 
 # Post-Quantum TLS Handshake Example using BouncyCastle JSSE on JDK 24
 #
-# Demonstrates a real PQC TLS 1.3 handshake with X25519MLKEM768 hybrid
-# key exchange using BouncyCastle's JSSE provider (BCJSSE), without
-# requiring JDK 27's JEP 527.
-#
-# The self-contained test creates an SSLServerSocket and SSLSocket,
-# both using BCJSSE, with the client offering X25519MLKEM768 for
-# key exchange and secp256r1 for ECDSA authentication.
-# A successful handshake proves PQC key exchange was negotiated.
+# SSL/TLS is configured entirely via camel.ssl.* properties in
+# application.properties (provider=BCJSSE, selfSigned=true, namedGroups).
+# The routes only need to verify the PQC handshake.
+# Additionally demonstrates JDK 24's native ML-KEM API (JEP 496).
 
 # Route 1: PQC TLS handshake verification at startup
-# Generates EC key pair via BC, creates SSLContext via BCJSSE,
-# performs a real TLS 1.3 handshake with X25519MLKEM768.
 - route:
     id: pqc-verify
     from:
@@ -39,80 +33,22 @@
         - script:
             groovy: |
               import javax.net.ssl.*
-              import java.security.*
-              import java.security.cert.X509Certificate
-              import java.math.BigInteger
-              import java.util.Date
-              import org.bouncycastle.asn1.x500.X500Name
-              import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
-              import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
-              import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 
               def serverSocket = null
               def accepted = null
 
               try {
-                  def bcProvider = Security.getProvider("BC")
+                  def sslCtx = camelContext.getSSLContextParameters().createSSLContext(camelContext)
 
-                  // Generate EC key pair using BouncyCastle with explicit named curve
-                  def kpg = KeyPairGenerator.getInstance("EC", bcProvider)
-                  kpg.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"))
-                  def keyPair = kpg.generateKeyPair()
-
-                  // Create self-signed certificate using BouncyCastle
-                  def subject = new X500Name("CN=localhost, OU=Camel, O=Apache, C=US")
-                  def now = new Date()
-                  def notBefore = new Date(now.getTime() - 86400000L)
-                  def notAfter = new Date(now.getTime() + 365L * 86400000L)
-                  def serial = BigInteger.valueOf(System.currentTimeMillis())
-
-                  def certBuilder = new JcaX509v3CertificateBuilder(
-                      subject, serial, notBefore, notAfter, subject, keyPair.getPublic())
-
-                  def signer = new JcaContentSignerBuilder("SHA256withECDSA")
-                      .setProvider(bcProvider).build(keyPair.getPrivate())
-                  def cert = new JcaX509CertificateConverter()
-                      .setProvider(bcProvider).getCertificate(certBuilder.build(signer))
-
-                  // Create in-memory JKS keystore with the BC-generated key
-                  def ks = KeyStore.getInstance("JKS")
-                  ks.load(null, null)
-                  ks.setKeyEntry("server", keyPair.getPrivate(),
-                      "changeit".toCharArray(),
-                      [cert] as java.security.cert.Certificate[])
-
-                  // Create truststore with the same certificate
-                  def ts = KeyStore.getInstance("JKS")
-                  ts.load(null, null)
-                  ts.setCertificateEntry("server", cert)
-
-                  // Use BCJSSE's PKIX KeyManagerFactory and TrustManagerFactory
-                  def kmf = KeyManagerFactory.getInstance("PKIX", "BCJSSE")
-                  kmf.init(ks, "changeit".toCharArray())
-
-                  def tmf = TrustManagerFactory.getInstance("PKIX", "BCJSSE")
-                  tmf.init(ts)
-
-                  // Create SSLContext using BCJSSE
-                  def sslCtx = SSLContext.getInstance("TLSv1.3", "BCJSSE")
-                  sslCtx.init(kmf.getKeyManagers(), tmf.getTrustManagers(),
-                      SecureRandom.getInstance("DEFAULT", bcProvider))
-
-                  // --- Server side ---
                   serverSocket = sslCtx.getServerSocketFactory().createServerSocket(0) as SSLServerSocket
                   def port = serverSocket.getLocalPort()
 
-                  // --- Client side (in a thread) ---
                   def handshakeResult = new java.util.concurrent.CompletableFuture()
 
                   Thread.start {
                       try {
                           def cs = sslCtx.getSocketFactory().createSocket("localhost", port)
 
-                          // Client offers X25519MLKEM768 for PQC key exchange
-                          // and secp256r1 for ECDSA signature verification.
-                          // Both are needed: X25519MLKEM768 for the key exchange,
-                          // secp256r1 because the server uses an EC certificate.
                           def bcClientParams = new org.bouncycastle.jsse.BCSSLParameters()
                           bcClientParams.setNamedGroups(["X25519MLKEM768", "secp256r1"] as String[])
                           ((org.bouncycastle.jsse.BCSSLSocket) cs).setParameters(bcClientParams)
@@ -131,12 +67,10 @@
                       }
                   }
 
-                  // Server accepts the connection
                   accepted = serverSocket.accept()
                   ((SSLSocket) accepted).startHandshake()
                   def serverSession = ((SSLSocket) accepted).getSession()
 
-                  // Wait for client result
                   def clientResult = handshakeResult.get(10, java.util.concurrent.TimeUnit.SECONDS)
 
                   def result = [
@@ -177,7 +111,7 @@
               }
         - log: "PQC Verification Result:\n${body}"
 
-# Route 2: REST API endpoint (served over plain HTTP)
+# Route 2: REST API endpoint
 - route:
     id: pqc-secure-server
     from:
@@ -211,55 +145,12 @@
         - script:
             groovy: |
               import javax.net.ssl.*
-              import java.security.*
-              import java.security.cert.X509Certificate
-              import java.math.BigInteger
-              import java.util.Date
-              import org.bouncycastle.asn1.x500.X500Name
-              import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
-              import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
-              import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 
               def serverSocket = null
               def accepted = null
 
               try {
-                  def bcProvider = Security.getProvider("BC")
-                  def kpg = KeyPairGenerator.getInstance("EC", bcProvider)
-                  kpg.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"))
-                  def keyPair = kpg.generateKeyPair()
-
-                  def subject = new X500Name("CN=localhost, O=Apache, C=US")
-                  def now = new Date()
-                  def serial = BigInteger.valueOf(System.currentTimeMillis())
-                  def certBuilder = new JcaX509v3CertificateBuilder(
-                      subject, serial,
-                      new Date(now.getTime() - 86400000L),
-                      new Date(now.getTime() + 365L * 86400000L),
-                      subject, keyPair.getPublic())
-                  def signer = new JcaContentSignerBuilder("SHA256withECDSA")
-                      .setProvider(bcProvider).build(keyPair.getPrivate())
-                  def cert = new JcaX509CertificateConverter()
-                      .setProvider(bcProvider).getCertificate(certBuilder.build(signer))
-
-                  def ks = KeyStore.getInstance("JKS")
-                  ks.load(null, null)
-                  ks.setKeyEntry("server", keyPair.getPrivate(),
-                      "changeit".toCharArray(),
-                      [cert] as java.security.cert.Certificate[])
-
-                  def ts = KeyStore.getInstance("JKS")
-                  ts.load(null, null)
-                  ts.setCertificateEntry("server", cert)
-
-                  def kmf = KeyManagerFactory.getInstance("PKIX", "BCJSSE")
-                  kmf.init(ks, "changeit".toCharArray())
-                  def tmf = TrustManagerFactory.getInstance("PKIX", "BCJSSE")
-                  tmf.init(ts)
-
-                  def sslCtx = SSLContext.getInstance("TLSv1.3", "BCJSSE")
-                  sslCtx.init(kmf.getKeyManagers(), tmf.getTrustManagers(),
-                      SecureRandom.getInstance("DEFAULT", bcProvider))
+                  def sslCtx = camelContext.getSSLContextParameters().createSSLContext(camelContext)
 
                   serverSocket = sslCtx.getServerSocketFactory().createServerSocket(0) as SSLServerSocket
                   def port = serverSocket.getLocalPort()
@@ -389,8 +280,6 @@
                   ])
 
                   // --- Test 3: Cross-provider (JDK keys re-encoded for BC KEM) ---
-                  // Providers don't recognize each other's key objects directly,
-                  // so we re-encode through standard formats (X.509 / PKCS#8).
                   def crossTest1 = [test: "JDK keygen -> BC encapsulate/decapsulate (re-encoded)"]
                   try {
                       def bcKf = KeyFactory.getInstance("ML-KEM", "BC")
@@ -499,7 +388,6 @@
                   }
               } catch (Exception ignore) {}
 
-              // Check for JDK 24 native KEM support
               def nativeKemAlgorithms = []
               try {
                   Security.getProviders().each { p ->
